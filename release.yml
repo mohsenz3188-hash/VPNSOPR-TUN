@@ -1,0 +1,78 @@
+name: Build, test and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New release version, for example v0.1.0'
+        required: true
+        type: string
+        default: 'v0.1.0'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: bash -n install.sh
+      - run: node --check web/app.js
+  release:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: Validate release version
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Version must have the form vX.Y.Z'
+            exit 1
+          fi
+          if git rev-parse --verify "refs/tags/$RELEASE_VERSION" >/dev/null 2>&1; then
+            tag_commit="$(git rev-parse "refs/tags/$RELEASE_VERSION^{commit}")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo 'Existing tag points to another commit; choose a new version.'
+              exit 1
+            fi
+          fi
+      - name: Build Linux releases
+        run: |
+          mkdir -p dist staging
+          for arch in amd64 arm64 arm; do
+            label="$arch"
+            if [ "$arch" = arm ]; then label=armv7; fi
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" GOARM=7 go build -trimpath -ldflags='-s -w' -o staging/vpnsopr .
+            tar -czf "dist/vpnsopr_linux_${label}.tar.gz" -C staging vpnsopr
+          done
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo 'Release already exists; choose a new version.'
+            exit 1
+          fi
+          gh release create "$RELEASE_VERSION" dist/*.tar.gz dist/SHA256SUMS --target "$GITHUB_SHA" --generate-notes
